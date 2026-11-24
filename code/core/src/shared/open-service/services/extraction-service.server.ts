@@ -7,6 +7,7 @@ import { getComponentIdFromEntry } from '../../../common/utils/component-id.ts';
 import {
   getStoryImportPathFromEntry,
   isEligibleStoryEntry,
+  isManifestEntry,
   selectComponentEntriesByComponentId,
 } from '../../../common/utils/select-component-entry.ts';
 import { OpenServiceDocgenMissingComponentError } from '../../../server-errors.ts';
@@ -32,20 +33,27 @@ type ExtractionServiceState = { components: Record<string, unknown> };
  * stored: it returns the payload, or `undefined` when nothing has been extracted for that id. `.get()`
  * never fires the query's `load`, so reading it cannot trigger a behind-the-scenes extraction.
  */
-type ComponentPayloadQuery = { get(input: { id: string }): unknown };
+type ComponentPayloadQuery = { get(input: object): unknown };
 
 type AllComponentsQuery = { get(): unknown };
 
-// Per registered service: the ids to extract again until an extraction of them completes. They were
-// missing from the index (a reverted rename or `git stash pop` brings them back) or their stories
-// changed, so a failed refresh is retried on the next index change.
-const pendingIdsByService = new WeakMap<object, Set<string>>();
+type RegisteredExtraction = {
+  // The ids to extract again until an extraction of them completes. They were missing from the
+  // index (a reverted rename or `git stash pop` brings them back) or their stories changed, so a
+  // failed refresh is retried on the next index change.
+  pendingIds: Set<string>;
+  toQueryInput: (id: string) => object;
+};
+
+const registeredExtractions = new WeakMap<object, RegisteredExtraction>();
 
 export type ExtractionInput = {
   /** The entry {@link selectComponentEntriesByComponentId} picks for the component. */
   entry: IndexEntry;
   /** Every story of the component, which spans several CSF files when they share a title. */
   storyEntries: IndexEntry[];
+  /** The ids of the component's stories that are in the manifests. */
+  manifestStoryIds: Set<string>;
 };
 
 type ExtractionProvider<TPayload> = (input: ExtractionInput) => Promise<TPayload | undefined>;
@@ -58,7 +66,12 @@ export const toExtractionError = (error: unknown): ExtractionError =>
     ? { name: error.name, message: error.message }
     : { name: 'Error', message: String(error) };
 
-export type RegisterExtractionServiceOptions<TPayload, TQueries, TCommands> = {
+export type RegisterExtractionServiceOptions<
+  TState extends ExtractionServiceState,
+  TQueries,
+  TCommands,
+  TPayload = TState['components'][string],
+> = {
   getIndex: () => Promise<StoryIndex>;
   provider: ExtractionProvider<TPayload>;
   /**
@@ -74,6 +87,21 @@ export type RegisterExtractionServiceOptions<TPayload, TQueries, TCommands> = {
   extractCommand: keyof TCommands & string;
   /** Command that extracts every component in the story index. Keyed against the service's commands. */
   extractAllCommand: keyof TCommands & string;
+  /**
+   * The input of `queryName` that reads one component. Defaults to `{ id }`; a query whose input
+   * has more fields sets them here, for the static build and for the checks that read the state.
+   */
+  toQueryInput?: (id: string) => object;
+  /**
+   * Stores one component's payload in the state, or removes it when `payload` is `undefined`.
+   * Defaults to `state.components[key]`. `input` is the component's input when it is in the index.
+   */
+  writeComponent?: (
+    state: TState,
+    key: string,
+    payload: TPayload | undefined,
+    input: ExtractionInput | undefined
+  ) => void;
 };
 
 /**
@@ -112,15 +140,18 @@ export function subscribeExtractionServiceToModuleGraphChanges<
   const moduleGraph = getService<ModuleGraphService>('core/module-graph', { internal: true });
   const query: ComponentPayloadQuery = runtime.queries[options.queryName];
   const allQuery: AllComponentsQuery = runtime.queries[options.allQueryName];
-  const pendingIds = pendingIdsByService.get(runtime);
-  invariant(pendingIds, `Extraction service "${definition.id}" is not registered.`);
+  const registered = registeredExtractions.get(runtime);
+  invariant(registered, `Extraction service "${definition.id}" is not registered.`);
+  const { pendingIds, toQueryInput } = registered;
   const extract = (runtime.commands as Record<string, (input: { id: string }) => Promise<unknown>>)[
     options.extractCommand
   ];
   const refreshComponent = (id: string) => extract({ id }).catch(() => undefined);
 
   const refreshExtracted = async (componentIds: Iterable<string>) => {
-    const idsToRefresh = Array.from(componentIds).filter((id) => query.get({ id }) !== undefined);
+    const idsToRefresh = Array.from(componentIds).filter(
+      (id) => query.get(toQueryInput(id)) !== undefined
+    );
     if (idsToRefresh.length === 0) {
       return;
     }
@@ -190,14 +221,17 @@ export function subscribeExtractionServiceToModuleGraphChanges<
   });
 }
 
-// The entry each component is extracted from and its story ids, keyed by component id.
+// The entry each component is extracted from and its story ids, keyed by component id. A story id
+// ends in `!` when the story is not in the manifests, so a tag change extracts the component again.
 const getStoryIdsByComponent = (index: StoryIndex): Map<string, string> => {
   const entries = Object.values(index.entries);
   const storyEntries = Map.groupBy(entries.filter(isEligibleStoryEntry), getComponentIdFromEntry);
   return new Map(
     Array.from(selectComponentEntriesByComponentId(entries), ([id, entry]) => [
       id,
-      [entry, ...(storyEntries.get(id) ?? [])].map((story) => story.id).join('\n'),
+      [entry, ...(storyEntries.get(id) ?? [])]
+        .map((story) => (isManifestEntry(story) ? story.id : `${story.id}!`))
+        .join('\n'),
     ])
   );
 };
@@ -217,10 +251,24 @@ export function registerExtractionService<
   TCommands extends Commands<TState>,
 >(
   definition: ServiceDefinition<TState, TQueries, TCommands>,
-  options: RegisterExtractionServiceOptions<TState['components'][string], TQueries, TCommands>
+  options: RegisterExtractionServiceOptions<TState, TQueries, TCommands>
 ) {
-  const { getIndex, provider, buildErrorPayload, queryName, extractCommand, extractAllCommand } =
-    options;
+  const {
+    getIndex,
+    provider,
+    buildErrorPayload,
+    queryName,
+    extractCommand,
+    extractAllCommand,
+    toQueryInput = (id: string) => ({ id }),
+    writeComponent = (state, key, payload) => {
+      if (payload) {
+        state.components[key] = payload;
+      } else {
+        delete state.components[key];
+      }
+    },
+  } = options;
 
   // The registration object below is built with computed keys and cast to `ServiceRegistrationOptions`,
   // which defeats TS's per-key checking. Assert the names exist on the definition so a typo fails here
@@ -261,24 +309,23 @@ export function registerExtractionService<
     const entries = Object.values((await getIndex()).entries);
     const storyEntries = Map.groupBy(entries.filter(isEligibleStoryEntry), getComponentIdFromEntry);
     return new Map(
-      Array.from(selectComponentEntriesByComponentId(entries), ([id, entry]) => [
-        id,
-        { entry, storyEntries: storyEntries.get(id) ?? [] },
-      ])
+      Array.from(selectComponentEntriesByComponentId(entries), ([id, entry]) => {
+        const componentStoryEntries = storyEntries.get(id) ?? [];
+        const manifestStoryIds = new Set(
+          componentStoryEntries.filter(isManifestEntry).map((storyEntry) => storyEntry.id)
+        );
+        return [id, { entry, storyEntries: componentStoryEntries, manifestStoryIds }];
+      })
     );
   };
 
   const writePayload = (
     state: TState,
     id: string,
-    payload: TState['components'][string] | undefined
+    payload: TState['components'][string] | undefined,
+    input?: ExtractionInput
   ): void => {
-    const key = toComponentStateKey(id);
-    if (payload) {
-      state.components[key] = payload;
-    } else {
-      delete state.components[key];
-    }
+    writeComponent(state, toComponentStateKey(id), payload, payload ? input : undefined);
   };
 
   const extractComponent = async (
@@ -296,13 +343,16 @@ export function registerExtractionService<
     }
     const payload = await provider(extractionInput);
     // The file can be deleted or the title renamed while the provider runs. When the index cannot
-    // be read, keep the payload.
-    const indexed = await resolveInputs().then(
-      (inputs) => inputs.has(id),
-      () => true
+    // be read, keep the payload. Its tags can change too, so the latest input stores the payload.
+    const latestInput = await resolveInputs().then(
+      (inputs) => inputs.get(id),
+      () => extractionInput
     );
+    const indexed = latestInput !== undefined;
     if (isLatestRun()) {
-      ctx.self.setState((state) => writePayload(state, id, indexed ? payload : undefined));
+      ctx.self.setState((state) =>
+        writePayload(state, id, indexed ? payload : undefined, latestInput)
+      );
       if (indexed) {
         pendingIds.delete(id);
       } else {
@@ -348,7 +398,8 @@ export function registerExtractionService<
     }
     ctx.self.setState((state) => {
       for (const [id, payload] of latestResults) {
-        writePayload(state, id, current.has(id) ? payload : undefined);
+        const input = current.get(id);
+        writePayload(state, id, input ? payload : undefined, input);
       }
     });
   };
@@ -358,7 +409,7 @@ export function registerExtractionService<
       [queryName]: {
         staticInputs: async () => {
           const inputs = await resolveInputs();
-          return Array.from(inputs.keys(), (id) => ({ id }));
+          return Array.from(inputs.keys(), toQueryInput);
         },
       },
     },
@@ -387,8 +438,8 @@ export function registerExtractionService<
     },
   } as unknown as ServiceRegistrationOptions<TState, TQueries, TCommands>);
   // A second registration returns the first instance, whose commands write the first set.
-  if (!pendingIdsByService.has(service)) {
-    pendingIdsByService.set(service, pendingIds);
+  if (!registeredExtractions.has(service)) {
+    registeredExtractions.set(service, { pendingIds, toQueryInput });
   }
   return service;
 }

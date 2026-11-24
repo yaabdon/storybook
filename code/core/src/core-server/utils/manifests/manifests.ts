@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 
-import { selectComponentEntriesByComponentId } from 'storybook/internal/common';
+import { isManifestEntry, selectComponentEntriesByComponentId } from 'storybook/internal/common';
 import { logger } from 'storybook/internal/node-logger';
 import type { Manifests, Presets } from 'storybook/internal/types';
 
@@ -9,7 +9,6 @@ import type { Polka } from 'polka';
 import invariant from 'tiny-invariant';
 
 import { getService } from '../../../shared/open-service/server.ts';
-import { Tag } from '../../../shared/constants/tags.ts';
 import type { ComponentsManifest } from '../../../types/modules/core-common.ts';
 import { getOwn } from '../../../shared/open-service/plain-object.ts';
 import { readAllComponents } from '../../../shared/open-service/services/component-state-key.ts';
@@ -113,9 +112,7 @@ async function getManifestEntries(presets: Presets) {
   const generator = await presets.apply('storyIndexGenerator');
   invariant(generator, 'storyIndexGenerator must be configured');
   const index = await generator.getIndex();
-  return Object.values(index.entries).filter(
-    (entry) => entry.tags?.includes(Tag.MANIFEST) ?? false
-  );
+  return Object.values(index.entries).filter(isManifestEntry);
 }
 
 type ManifestEntries = Awaited<ReturnType<typeof getManifestEntries>>;
