@@ -318,7 +318,18 @@ describe('createServiceDocsAccess resolve', () => {
       },
     });
     expect(docgen).toHaveBeenCalledWith({ id: 'alpha' });
+    expect(storyDocs).toHaveBeenCalledWith({ id: 'alpha', scope: 'manifest' });
     expect(mdxForAllComponents).not.toHaveBeenCalled();
+  });
+
+  it('leaves out stories and their import when no story of the component is in the manifests', async () => {
+    storyDocs.mockResolvedValue({ ...alphaStoryDocs, stories: {} });
+
+    const resolved = await createAccess().resolve('alpha');
+
+    expect(resolved).toMatchObject({ component: { id: 'alpha', name: 'Alpha' } });
+    expect(resolved).not.toHaveProperty('component.stories');
+    expect(resolved).not.toHaveProperty('component.import');
   });
 
   it('resolves a component whose payloads are absent, falling back to the id', async () => {
