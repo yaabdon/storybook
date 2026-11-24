@@ -146,8 +146,11 @@ export function toComponentManifestIndexEntries(
       ...(payload?.summary !== undefined ? { summary: payload.summary } : {}),
       ...(payload ? { docgen: { $ref: docgenManifestRef(id) } } : {}),
       // Stories are indexed whether or not a component was extracted, so the ref does not hang off
-      // the docgen payload: dropping it hid every story of a componentless component.
-      ...(storyDocs ? { stories: { $ref: storyDocsManifestRef(id) } } : {}),
+      // the docgen payload: dropping it hid every story of a componentless component. A component
+      // in the manifest only through its attached docs has no stories in it, and gets no ref.
+      ...(storyDocs && Object.keys(storyDocs.stories).length > 0
+        ? { stories: { $ref: storyDocsManifestRef(id) } }
+        : {}),
       ...(docs ? { docs } : {}),
     };
   }

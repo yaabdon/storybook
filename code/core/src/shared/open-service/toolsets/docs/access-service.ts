@@ -227,12 +227,17 @@ export function createServiceDocsAccess({
         : undefined;
     const docs = selectAttachedDocs(classification, id, mdxPayload);
 
+    // As in a build, a component without stories in the manifests shows neither stories nor import.
+    const stories =
+      storyDocsPayload && Object.keys(storyDocsPayload.stories).length > 0
+        ? storyDocsPayload.stories
+        : undefined;
     const core: CoreDocgenComponent = {
       ...docgenPayload,
       id,
       name: docgenPayload?.name ?? id,
-      ...(storyDocsPayload?.stories ? { stories: storyDocsPayload.stories } : {}),
-      ...(storyDocsPayload?.import ? { import: storyDocsPayload.import } : {}),
+      ...(stories ? { stories } : {}),
+      ...(stories && storyDocsPayload?.import ? { import: storyDocsPayload.import } : {}),
       ...(docs ? { docs } : {}),
     };
 
